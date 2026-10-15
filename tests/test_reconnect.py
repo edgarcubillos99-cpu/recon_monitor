@@ -10,6 +10,8 @@ from core.store import (
     STATE_DISCONNECT_REQUESTED,
     STATE_DISCONNECTED,
     STATE_RECONNECT_REQUESTED,
+    STATUS_CONNECTED,
+    STATUS_DISCONNECTED,
     WATCHED_STATES,
 )
 
@@ -21,13 +23,14 @@ def _ts(day):
 
 
 class FakeStore:
-    """Imita ReconnectStore con transiciones condicionadas al estado."""
+    """Imita ReconnectStore con transiciones condicionadas al estado e inventario connex_services."""
 
     def __init__(self, circuits):
         self.circuits = {sid: dict(row) for sid, row in circuits.items()}
         self.failed = {}
         self.requests = []
         self.packs = {}
+        self.services_status = {}
 
     def acquire_lock(self, ttl):
         return "tok"
@@ -41,11 +44,11 @@ class FakeStore:
     def clients_with_states(self, states=WATCHED_STATES):
         return sorted({row["client_id"] for row in self.circuits.values() if row["state"] in states})
 
-    def get_client_circuits(self, client_id, states=WATCHED_STATES):
+    def get_client_circuits(self, client_id, states=None):
         return {
             sid: {"service_id": sid, **row}
             for sid, row in self.circuits.items()
-            if row["client_id"] == str(client_id) and row["state"] in states
+            if row["client_id"] == str(client_id) and (states is None or row["state"] in states)
         }
 
     def set_circuit(self, client_id, service_id, state, expected_state, **fields):
@@ -60,6 +63,18 @@ class FakeStore:
 
     def delete_circuit(self, client_id, service_id, expected_state):
         return self.set_circuit(client_id, service_id, "active", expected_state)
+
+    def set_service_status(self, client_id, service_id, estado):
+        self.services_status[(str(client_id), str(service_id))] = estado
+
+    def sync_client_services(self, client_id, rows):
+        client_id = str(client_id)
+        wanted = {str(sid): estado for sid, estado in rows}
+        for (cid, sid) in list(self.services_status.keys()):
+            if cid == client_id and sid not in wanted:
+                del self.services_status[(cid, sid)]
+        for sid, estado in wanted.items():
+            self.services_status[(client_id, sid)] = estado
 
     def mark_failed(self, service_id, action, ticket_id, ttl):
         self.failed[(service_id, action)] = ticket_id
@@ -148,6 +163,13 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(rules.classify_service(rules.parse_service(svc("1", period="0"), now)), rules.SERVICE_IGNORED)
         self.assertEqual(rules.classify_service(rules.parse_service(svc("1", active="3"), now)), rules.SERVICE_EVALUABLE)
 
+    def test_circuit_state(self):
+        circuits = {"10": {"state": "disconnected"}, "20": {"state": "disconnect_requested"}}
+        self.assertEqual(rules.circuit_state({"service_id": "10", "status_code": "1"}, circuits), "disconnected")
+        self.assertEqual(rules.circuit_state({"service_id": "20", "status_code": "1"}, circuits), "disconnect_requested")
+        self.assertEqual(rules.circuit_state({"service_id": "30", "status_code": "3"}, circuits), "disconnected")
+        self.assertEqual(rules.circuit_state({"service_id": "30", "status_code": "1"}, circuits), "active")
+
     def test_overdue_attribution_and_baseline_note(self):
         invoices = [
             {"invid": "a", "due_date": TODAY - timedelta(days=3), "packs": [("99", "10")]},  # add-on de 10
@@ -170,14 +192,14 @@ class BotTest(unittest.TestCase):
     def test_lock_name_distinct(self):
         self.assertEqual(LOCK_NAME, "reconnect_cycle")
 
-    def test_full_cycle(self):
+    def test_full_cycle_and_inventory(self):
         overdue = _ts(TODAY - timedelta(days=10))
         store = FakeStore({
             "10": {"client_id": "1", "state": STATE_DISCONNECTED, "source": "baseline"},  # sin mora -> reconectar
             "11": {"client_id": "1", "state": STATE_DISCONNECTED, "source": "ticket"},    # con mora -> bloqueado
             "12": {"client_id": "1", "state": STATE_DISCONNECTED},                        # FiberX
             "13": {"client_id": "1", "state": STATE_DISCONNECTED},                        # cancelado -> borrar
-            "14": {"client_id": "1", "state": STATE_DISCONNECT_REQUESTED, "ticket_id": "5"},  # no tocar
+            "14": {"client_id": "1", "state": STATE_DISCONNECT_REQUESTED, "ticket_id": "5"},  # bot cortes: no tocar
             "20": {"client_id": "2", "state": STATE_RECONNECT_REQUESTED, "ticket_id": "700", "source": "baseline"},
             "30": {"client_id": "3", "state": STATE_RECONNECT_REQUESTED, "ticket_id": "800", "source": "ticket"},
         })
@@ -207,7 +229,7 @@ class BotTest(unittest.TestCase):
         self.assertEqual(store.circuits["12"]["state"], STATE_DISCONNECTED)
         self.assertNotIn("13", store.circuits)
         self.assertEqual(store.circuits["14"], {"client_id": "1", "state": STATE_DISCONNECT_REQUESTED, "ticket_id": "5"})
-        self.assertNotIn("20", store.circuits)  # Closed -> activo
+        self.assertNotIn("20", store.circuits)  # Closed -> activo (borrado de connex_circuits)
         self.assertEqual(store.circuits["30"]["state"], STATE_DISCONNECTED)  # Closed Incomplete
         self.assertEqual(store.failed[("30", "reconnect")], "800")
         self.assertEqual(store.requests[0][3], ["10"])
@@ -216,6 +238,21 @@ class BotTest(unittest.TestCase):
         self.assertEqual(summary["blocked_by_debt"], 1)
         self.assertEqual(summary["skipped_fiberx"], 1)
         self.assertEqual(summary["deleted_gone"], 1)
+
+        # Verificación del inventario connex_services:
+        # Cliente 2: ticket 700 Closed OK -> conectado
+        self.assertEqual(store.services_status.get(("2", "20")), STATUS_CONNECTED)
+        # Cliente 3: ticket 800 Closed Incomplete -> desconectado
+        self.assertEqual(store.services_status.get(("3", "30")), STATUS_DISCONNECTED)
+        # Cliente 1: servicio 10 pasa a reconnect_requested -> desconectado
+        self.assertEqual(store.services_status.get(("1", "10")), STATUS_DISCONNECTED)
+        # Cliente 1: servicio 11 con mora -> desconectado
+        self.assertEqual(store.services_status.get(("1", "11")), STATUS_DISCONNECTED)
+        # Cliente 1: servicio 14 en disconnect_requested (del bot de cortes) -> NUNCA conectado, siempre desconectado
+        self.assertEqual(store.services_status.get(("1", "14")), STATUS_DISCONNECTED)
+        # Cliente 1: servicio 12 (FiberX) y 13 (cancelado) -> eliminados de connex_services
+        self.assertNotIn(("1", "12"), store.services_status)
+        self.assertNotIn(("1", "13"), store.services_status)
 
     def test_dry_run_is_read_only(self):
         store = FakeStore({
@@ -229,6 +266,8 @@ class BotTest(unittest.TestCase):
         self.assertIn("13", store.circuits)
         self.assertEqual(summary["tickets_created"], 1)
         self.assertTrue(summary["actions"][0]["dry_run"])
+        # En dry run no se pone conectado ni se altera connex_services
+        self.assertEqual(store.services_status, {})
 
     def test_open_reconnect_ticket_blocks_but_disconnect_ticket_does_not(self):
         recent = str(int(datetime.now(timezone.utc).timestamp()) - 3600)

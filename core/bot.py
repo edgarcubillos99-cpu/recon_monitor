@@ -9,12 +9,16 @@ Ciclo:
    a. Servicios en Ubersmith (client.service_list). Circuito cancelado/terminado/
       inexistente -> DELETE (solo si sigue en un estado que vigila este servicio).
    b. reconnect_requested con ticket: support.ticket_get. Closed -> se borra la
-      fila (activo). Closed Incomplete / Deleted -> vuelve a disconnected y se
-      pausa en connex_failed.
+      fila (activo) y se actualiza connex_services a "conectado".
+      Closed Incomplete / Deleted -> vuelve a disconnected, se pausa en
+      connex_failed y se mantiene en "desconectado".
    c. disconnected evaluable (no FiberX, period != 0, active 1/2/3): si el
       servicio tiene 0 facturas vencidas -> reconectar.
    d. Un ticket por cliente con todos los servicios a reconectar, salvo ticket
       de reconexión abierto reciente en la cola o pausa en connex_failed.
+   e. Al final de evaluar el cliente, se sincroniza el inventario connex_services
+      con la lista real de servicios evaluables (conectado / desconectado),
+      eliminando cualquier servicio que ya no sea evaluable.
 
 Nunca toca disconnect_requested (lo cierra el bot de cortes), no crea tickets
 de desconexión, no usa OpenAI y no marca línea base.
@@ -33,6 +37,9 @@ from core.store import (
     STATE_ACTIVE,
     STATE_DISCONNECTED,
     STATE_RECONNECT_REQUESTED,
+    STATUS_CONNECTED,
+    STATUS_DISCONNECTED,
+    WATCHED_STATES,
     ReconnectStore,
 )
 from core.ubersmith_client import UbersmithAPIError, UbersmithClient
@@ -175,7 +182,7 @@ class ReconnectBot:
         result["actions"] = []
         result["blocked_report"] = []
 
-        circuits = self.store.get_client_circuits(client_id)
+        circuits = self.store.get_client_circuits(client_id, states=WATCHED_STATES)
         if not circuits:
             return result
         result["circuits_seen"] = len(circuits)
@@ -191,6 +198,18 @@ class ReconnectBot:
             result["skipped_no_services"] = len(circuits)
             return result
 
+        try:
+            self._evaluate_client_circuits(client_id, circuits, services, result)
+        finally:
+            evaluable_services = [
+                s for s in services.values()
+                if rules.classify_service(s) == rules.SERVICE_EVALUABLE
+            ]
+            self._sync_service_registry(client_id, evaluable_services)
+
+        return result
+
+    def _evaluate_client_circuits(self, client_id, circuits, services, result):
         candidates = []
         outcomes = {}
         for service_id, record in circuits.items():
@@ -229,7 +248,7 @@ class ReconnectBot:
 
         result["candidates"] = len(candidates)
         if not candidates:
-            return result
+            return
 
         today = datetime.now(BUSINESS_TZ).date()
         evaluable_ids = {
@@ -241,7 +260,7 @@ class ReconnectBot:
         result["blocked_by_debt"] = len(blocked)
         result["blocked_report"] = [{"client_id": client_id, **item} for item in blocked]
         if not reconnects:
-            return result
+            return
 
         event = self._request_reconnect(client_id, reconnects, len(unattributed))
         if event["status"] == "created":
@@ -251,7 +270,24 @@ class ReconnectBot:
             result["skipped_open_ticket"] += 1
         elif event["status"] == "state_changed":
             result["skipped_state_changed"] += 1
-        return result
+
+    def _sync_service_registry(self, client_id, services):
+        """
+        Sincroniza el inventario connex_services con todos los circuitos evaluables:
+        reconnect_requested / disconnected / disconnect_requested / Ubersmith active=3 -> desconectado;
+        activo sin fila de circuito -> conectado.
+        En dry-run no escribe en connex_services ni marca conectado.
+        """
+        if self.dry_run:
+            logger.info("Dry-run: no se actualiza connex_services para cliente %s", client_id)
+            return
+        circuits = self.store.get_client_circuits(client_id)
+        rows = []
+        for service in services:
+            state = rules.circuit_state(service, circuits)
+            estado = STATUS_DISCONNECTED if state != STATE_ACTIVE else STATUS_CONNECTED
+            rows.append((service["service_id"], estado))
+        self.store.sync_client_services(client_id, rows)
 
     def _delete_gone(self, client_id, service_id, state, service):
         status = service["status_code"] if service else "no existe"
@@ -282,6 +318,7 @@ class ReconnectBot:
             )
             if not self.dry_run:
                 self._revert_to_disconnected(client_id, service_id, record, "reconnect_requested sin ticket")
+                self.store.set_service_status(client_id, service_id, STATUS_DISCONNECTED)
             return "reconnect_failed"
 
         if ticket_id not in outcomes:
@@ -299,11 +336,13 @@ class ReconnectBot:
         if outcome == "done":
             # state=active borra la fila: misma semántica que ConnexMonitor.
             self.store.set_circuit(client_id, service_id, STATE_ACTIVE, expected_state=STATE_RECONNECT_REQUESTED)
+            self.store.set_service_status(client_id, service_id, STATUS_CONNECTED)
             return "reconnected"
 
         self._revert_to_disconnected(client_id, service_id, record, f"Reconexión no completada (ticket {ticket_id})")
         # Sin esta pausa, un "Closed Incomplete" haría pedir lo mismo en cada ciclo.
         self.store.mark_failed(service_id, ACTION, ticket_id, self.open_ticket_max_age_days * 86400)
+        self.store.set_service_status(client_id, service_id, STATUS_DISCONNECTED)
         return "reconnect_failed"
 
     def _revert_to_disconnected(self, client_id, service_id, record, reason):

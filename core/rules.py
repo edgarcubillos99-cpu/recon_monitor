@@ -38,6 +38,17 @@ SERVICE_IGNORED = "ignored"      # period=0: no es un circuito recurrente; no se
 SERVICE_FIBERX = "fiberx"        # FiberX: nunca se reconecta; no se toca
 SERVICE_EVALUABLE = "evaluable"  # se evalúa la mora
 
+SUSPENDED_SERVICE_CODE = "3"
+
+
+def circuit_state(service, circuits):
+    record = circuits.get(service["service_id"])
+    if record:
+        return record.get("state") or "active"
+    if service.get("status_code") == SUSPENDED_SERVICE_CODE:
+        return "disconnected"
+    return "active"
+
 
 def parse_money(value):
     if value is None or value == "":

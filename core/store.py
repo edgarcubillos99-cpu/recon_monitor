@@ -2,16 +2,17 @@
 Store MySQL compartido con ConnexMonitor (misma instancia y MYSQL_DATABASE).
 
 Derivado de ConnexMonitor (core/ticket_store.py), recortado a lo que usa el
-servicio de reconexiones. Diferencias deliberadas:
+servicio de reconexiones. Características:
 
 - Solo crea (IF NOT EXISTS) las tablas que usa: connex_circuits,
-  connex_invoice_packs, connex_failed, connex_requests y connex_lock.
+  connex_services, connex_invoice_packs, connex_failed, connex_requests y connex_lock.
   Nunca toca connex_meta, connex_baseline_pending, connex_contract_clients
   ni connex_analysis_cache. No dropea nada.
 - Candado propio: connex_lock.name = 'reconnect_cycle' (el bot de cortes usa 'cycle').
 - Las transiciones de circuito llevan `expected_state`: el UPDATE/DELETE solo
   aplica si la fila sigue en ese estado. Así nunca se pisa un
   disconnect_requested escrito por el bot de cortes entre la lectura y la escritura.
+- Mantiene al día el inventario connex_services (conectado / desconectado).
 """
 
 import json
@@ -33,10 +34,20 @@ STATE_DISCONNECT_REQUESTED = "disconnect_requested"
 STATE_DISCONNECTED = "disconnected"
 STATE_RECONNECT_REQUESTED = "reconnect_requested"
 
+STATUS_CONNECTED = "conectado"
+STATUS_DISCONNECTED = "desconectado"
+
+# Lo que el inventario muestra como desconectado (visión de los inspectores).
+DISCONNECTED_STATES = {
+    STATE_DISCONNECTED,
+    STATE_DISCONNECT_REQUESTED,
+    STATE_RECONNECT_REQUESTED,
+}
+
 SOURCE_TICKET = "ticket"
 SOURCE_BASELINE = "baseline"
 
-# Estados que este servicio lee. disconnect_requested es del bot de cortes.
+# Estados que este servicio lee como candidatos o para sincronizar tickets.
 WATCHED_STATES = (STATE_DISCONNECTED, STATE_RECONNECT_REQUESTED)
 
 INVOICE_PACKS_TTL = 60 * 60 * 24 * 90
@@ -46,7 +57,7 @@ DATABASE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 # Conexión caída o cerrada por el servidor remoto: se reabre y se reintenta una vez.
 RECONNECT_ERRORS = {0, 2006, 2013, 2014, 2055}
 
-# Mismo DDL que ConnexMonitor para que da igual cuál de los dos arranque primero.
+# Mismo DDL que ConnexMonitor para que dé igual cuál de los dos arranque primero.
 SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS connex_circuits (
@@ -60,6 +71,14 @@ SCHEMA = (
         reason TEXT NULL,
         requested_at VARCHAR(40) NULL,
         source VARCHAR(16) NOT NULL DEFAULT 'ticket',
+        updated_at DATETIME NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS connex_services (
+        service_id VARCHAR(32) NOT NULL PRIMARY KEY,
+        client_id VARCHAR(32) NOT NULL,
+        estado VARCHAR(16) NOT NULL,
         updated_at DATETIME NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
@@ -103,6 +122,8 @@ INDEXES = (
     ("connex_circuits", "idx_circuits_client", "client_id"),
     ("connex_circuits", "idx_circuits_state_source", "state, source"),
     ("connex_circuits", "idx_circuits_ticket", "ticket_id"),
+    ("connex_services", "idx_services_client", "client_id"),
+    ("connex_services", "idx_services_estado", "estado"),
     ("connex_invoice_packs", "idx_invoice_packs_expires", "expires_at"),
     ("connex_failed", "idx_failed_expires", "expires_at"),
     ("connex_requests", "idx_requests_client", "client_id, created_at"),
@@ -151,7 +172,6 @@ class ReconnectStore:
     # --- Conexión ---
 
     def _connect(self):
-        # La base la crea ConnexMonitor; este servicio no crea bases de datos.
         return pymysql.connect(database=self.database, **self._params)
 
     def _conn(self):
@@ -170,12 +190,15 @@ class ReconnectStore:
             except pymysql.err.Error:
                 pass
 
-    def _execute(self, sql, params=None, fetch=None):
+    def _execute(self, sql, params=None, fetch=None, many=False):
         for attempt in (1, 2):
             conn = self._conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(sql, params)
+                    if many:
+                        cur.executemany(sql, params)
+                    else:
+                        cur.execute(sql, params)
                     if fetch == "one":
                         return cur.fetchone()
                     if fetch == "all":
@@ -208,6 +231,20 @@ class ReconnectStore:
             "INSERT IGNORE INTO connex_lock (name, token, expires_at) VALUES (%s, '', %s)",
             (LOCK_NAME, _utc_naive()),
         )
+        self._execute(
+            """
+            INSERT IGNORE INTO connex_services (service_id, client_id, estado, updated_at)
+            SELECT service_id, client_id, %s, UTC_TIMESTAMP()
+            FROM connex_circuits
+            WHERE state IN (%s, %s, %s)
+            """,
+            (
+                STATUS_DISCONNECTED,
+                STATE_DISCONNECTED,
+                STATE_DISCONNECT_REQUESTED,
+                STATE_RECONNECT_REQUESTED,
+            ),
+        )
 
     # --- Circuitos ---
 
@@ -233,13 +270,25 @@ class ReconnectStore:
         )
         return sorted({row["client_id"] for row in rows or []}, key=lambda value: (len(value), value))
 
-    def get_client_circuits(self, client_id, states=WATCHED_STATES):
-        placeholders = ", ".join(["%s"] * len(states))
-        rows = self._execute(
-            f"SELECT * FROM connex_circuits WHERE client_id = %s AND state IN ({placeholders})",
-            (str(client_id), *states),
-            fetch="all",
-        )
+    def get_client_circuits(self, client_id, states=None):
+        """
+        Si states es None, devuelve todos los circuitos del cliente (para no ignorar
+        disconnect_requested al sincronizar el inventario).
+        """
+        if states:
+            states = [str(state) for state in states]
+            placeholders = ", ".join(["%s"] * len(states))
+            rows = self._execute(
+                f"SELECT * FROM connex_circuits WHERE client_id = %s AND state IN ({placeholders})",
+                (str(client_id), *states),
+                fetch="all",
+            )
+        else:
+            rows = self._execute(
+                "SELECT * FROM connex_circuits WHERE client_id = %s",
+                (str(client_id),),
+                fetch="all",
+            )
         return {row["service_id"]: self._circuit_record(row) for row in rows or []}
 
     def set_circuit(self, client_id, service_id, state, expected_state, **fields):
@@ -293,7 +342,64 @@ class ReconnectStore:
         )
         return bool(changed)
 
-    # --- Pausa tras "Closed Incomplete" / "Deleted" ---
+    # --- Inventario connex_services ---
+
+    def set_service_status(self, client_id, service_id, estado):
+        """Actualiza el estado de un circuito individual en connex_services."""
+        if estado not in {STATUS_CONNECTED, STATUS_DISCONNECTED}:
+            raise ValueError(f"estado inválido: {estado}")
+        self._execute(
+            """
+            INSERT INTO connex_services (service_id, client_id, estado, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                client_id = VALUES(client_id),
+                estado = VALUES(estado),
+                updated_at = VALUES(updated_at)
+            """,
+            (str(service_id), str(client_id), estado, _utc_naive()),
+        )
+
+    def sync_client_services(self, client_id, rows):
+        """
+        Inventario del cliente: reemplaza la lista de servicios evaluables.
+        rows = [(service_id, estado), ...]. Lo que ya no viene se borra
+        (cancelado, terminado, FiberX, cargo único).
+        """
+        client_id = str(client_id)
+        wanted = {}
+        for service_id, estado in rows:
+            if estado not in {STATUS_CONNECTED, STATUS_DISCONNECTED}:
+                raise ValueError(f"estado inválido: {estado}")
+            wanted[str(service_id)] = estado
+        now = _utc_naive()
+        if wanted:
+            self._execute(
+                """
+                INSERT INTO connex_services (service_id, client_id, estado, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    client_id = VALUES(client_id),
+                    estado = VALUES(estado),
+                    updated_at = VALUES(updated_at)
+                """,
+                [(service_id, client_id, estado, now) for service_id, estado in wanted.items()],
+                many=True,
+            )
+        existing = self._execute(
+            "SELECT service_id FROM connex_services WHERE client_id = %s",
+            (client_id,),
+            fetch="all",
+        )
+        stale = [row["service_id"] for row in existing or [] if row["service_id"] not in wanted]
+        if stale:
+            placeholders = ", ".join(["%s"] * len(stale))
+            self._execute(
+                f"DELETE FROM connex_services WHERE client_id = %s AND service_id IN ({placeholders})",
+                (client_id, *stale),
+            )
+
+    # --- Pausa tras "Closed Incomplete" ---
 
     def mark_failed(self, service_id, action, ticket_id, ttl_seconds):
         self._execute(
