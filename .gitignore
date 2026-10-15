@@ -1,0 +1,51 @@
+# Entornos y credenciales / secretos
+.env
+.env.*
+!.env.example
+
+# Carpeta de referencia y copias locales
+_ref/
+scratch/
+
+# Python: bytecode y cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Entornos virtuales
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Pruebas y cobertura
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Distribución y empaquetado
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs y bases temporales
+*.log
+*.sqlite3
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
