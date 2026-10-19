@@ -10,8 +10,8 @@ services:
       TZ: America/Puerto_Rico
       # Una ejecución al día a esta hora (America/Puerto_Rico). Sobrescribible desde .env.
       CONNEX_DAILY_AT: ${CONNEX_DAILY_AT:-06:00}
-      # Solo corre de lunes a jueves; viernes, sábado y domingo no hace nada.
-      CONNEX_RUN_DAYS: ${CONNEX_RUN_DAYS:-mon,tue,wed,thu}
+      # Reconexiones: todos los días.
+      CONNEX_RUN_DAYS: ${CONNEX_RUN_DAYS:-mon,tue,wed,thu,fri,sat,sun}
       # 1 = ejecuta un ciclo al arrancar el contenedor además del diario.
       CONNEX_RUN_ON_START: ${CONNEX_RUN_ON_START:-0}
       # Seguro por defecto: no crea tickets ni escribe. Poner CONNEX_DRY_RUN=0 en .env para producción.

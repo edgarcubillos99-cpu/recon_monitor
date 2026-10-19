@@ -12,7 +12,7 @@ from core.rules import BUSINESS_TZ
 
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-DEFAULT_RUN_DAYS = "mon,tue,wed,thu"
+DEFAULT_RUN_DAYS = "mon,tue,wed,thu,fri,sat,sun"
 
 
 def _parse_run_days(value):
