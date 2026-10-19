@@ -15,10 +15,12 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY core ./core
-COPY run_reconnect.py .
+COPY run_reconnect.py wait_for_mysql.py docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
+ENTRYPOINT ["./docker-entrypoint.sh"]
 # Una ejecución diaria a la hora CONNEX_DAILY_AT (ver docker-compose.yml).
 CMD ["python", "run_reconnect.py"]

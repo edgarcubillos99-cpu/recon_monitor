@@ -54,6 +54,8 @@ INVOICE_PACKS_TTL = 60 * 60 * 24 * 90
 LOCK_NAME = "reconnect_cycle"
 CIRCUIT_FIELDS = ("cid", "ticket_id", "queue", "previous_state", "reason", "requested_at", "source")
 DATABASE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+UNKNOWN_DATABASE = 1049
+DUPLICATE_KEY_NAME = 1061
 # Conexión caída o cerrada por el servidor remoto: se reabre y se reintenta una vez.
 RECONNECT_ERRORS = {0, 2006, 2013, 2014, 2055}
 
@@ -149,6 +151,9 @@ class ReconnectStore:
         user = os.getenv("MYSQL_USER")
         if not host or not user:
             raise ValueError("Faltan MYSQL_HOST y MYSQL_USER en las variables de entorno.")
+        if host in {"localhost", "127.0.0.1", "::1"} and os.path.exists("/.dockerenv"):
+            host = "host.docker.internal"
+            logger.warning("MYSQL_HOST=localhost no sirve en Docker; se usa host.docker.internal")
         self._params = {
             "host": host,
             "port": int(os.getenv("MYSQL_PORT", "3306")),
@@ -172,6 +177,21 @@ class ReconnectStore:
     # --- Conexión ---
 
     def _connect(self):
+        try:
+            return pymysql.connect(database=self.database, **self._params)
+        except pymysql.err.OperationalError as exc:
+            if exc.args[0] != UNKNOWN_DATABASE:
+                raise
+        server = pymysql.connect(**self._params)
+        try:
+            with server.cursor() as cur:
+                cur.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{self.database}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+        finally:
+            server.close()
+        logger.info("Base de datos MySQL %s creada", self.database)
         return pymysql.connect(database=self.database, **self._params)
 
     def _conn(self):
@@ -225,8 +245,12 @@ class ReconnectStore:
         existing = {(row["t"], row["i"]) for row in rows or []}
         for table, name, columns in INDEXES:
             if (table, name) not in existing:
-                self._execute(f"ALTER TABLE {table} ADD INDEX {name} ({columns})")
-                logger.info("Índice %s creado en %s", name, table)
+                try:
+                    self._execute(f"ALTER TABLE {table} ADD INDEX {name} ({columns})")
+                    logger.info("Índice %s creado en %s", name, table)
+                except pymysql.err.OperationalError as exc:
+                    if exc.args[0] != DUPLICATE_KEY_NAME:
+                        raise
         self._execute(
             "INSERT IGNORE INTO connex_lock (name, token, expires_at) VALUES (%s, '', %s)",
             (LOCK_NAME, _utc_naive()),
